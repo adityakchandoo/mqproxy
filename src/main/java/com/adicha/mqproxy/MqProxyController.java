@@ -19,8 +19,8 @@ import reactor.core.scheduler.Schedulers;
  *   mq_port        listener port
  *   mq_channel     server-connection channel
  *   qm_name        queue manager name
- *   mq_user        user id
- *   mq_pass        password
+ *   mq_user        user id                          (optional -> anonymous connection)
+ *   mq_pass        password                         (optional -> anonymous connection)
  *   mq_queue       request queue to put to            (optional if mq.request-queue is set)
  *   mq_reply_queue reply queue to read from           (optional -> temp dynamic queue is used)
  * </pre>
@@ -53,8 +53,8 @@ public class MqProxyController {
             @RequestHeader("mq_port") int port,
             @RequestHeader("mq_channel") String channel,
             @RequestHeader("qm_name") String queueManager,
-            @RequestHeader("mq_user") String user,
-            @RequestHeader("mq_pass") String password,
+            @RequestHeader(name = "mq_user", required = false) String user,
+            @RequestHeader(name = "mq_pass", required = false) String password,
             @RequestHeader(name = "mq_queue", required = false) String requestQueue,
             @RequestHeader(name = "mq_reply_queue", required = false) String replyQueue,
             @RequestBody(required = false) String payload) {

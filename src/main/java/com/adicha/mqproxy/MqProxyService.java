@@ -39,6 +39,8 @@ public class MqProxyService {
     private static final int UTF8_CCSID = 1208;
 
     private final int replyTimeoutMs;
+    private final String defaultUser;
+    private final String defaultPassword;
     private final String defaultRequestQueue;
     private final String defaultReplyQueue;
     private final String modelQueue;
@@ -46,11 +48,15 @@ public class MqProxyService {
 
     public MqProxyService(
             @Value("${mq.reply-timeout-ms:30000}") int replyTimeoutMs,
+            @Value("${mq.user:}") String defaultUser,
+            @Value("${mq.password:}") String defaultPassword,
             @Value("${mq.request-queue:}") String defaultRequestQueue,
             @Value("${mq.reply-queue:}") String defaultReplyQueue,
             @Value("${mq.model-queue:SYSTEM.DEFAULT.MODEL.QUEUE}") String modelQueue,
             @Value("${mq.dynamic-queue-name:MQPROXY.REPLY.*}") String dynamicQueueName) {
         this.replyTimeoutMs = replyTimeoutMs;
+        this.defaultUser = defaultUser;
+        this.defaultPassword = defaultPassword;
         this.defaultRequestQueue = defaultRequestQueue;
         this.defaultReplyQueue = defaultReplyQueue;
         this.modelQueue = modelQueue;
@@ -160,12 +166,17 @@ public class MqProxyService {
         props.put(MQC.PORT_PROPERTY, req.port());
         props.put(MQC.CHANNEL_PROPERTY, req.channel());
         props.put(MQC.TRANSPORT_PROPERTY, MQC.TRANSPORT_MQSERIES_CLIENT);
-        if (req.user() != null && !req.user().isBlank()) {
-            props.put(MQC.USER_ID_PROPERTY, req.user());
-            props.put(MQC.PASSWORD_PROPERTY, req.password() == null ? "" : req.password());
+
+        // Credentials are optional: on a local/test queue manager you can leave
+        // mq_user / mq_pass out and the channel's MCAUSER / CHLAUTH decides.
+        String user = firstNonBlank(req.user(), defaultUser);
+        if (user != null) {
+            String password = firstNonBlank(req.password(), defaultPassword);
+            props.put(MQC.USER_ID_PROPERTY, user);
+            props.put(MQC.PASSWORD_PROPERTY, password == null ? "" : password);
         }
         log.info("CONNECT {}:{} channel={} qm={} user={}",
-                req.host(), req.port(), req.channel(), req.queueManager(), req.user());
+                req.host(), req.port(), req.channel(), req.queueManager(), user == null ? "<none>" : user);
         return new MQQueueManager(req.queueManager(), props);
     }
 
