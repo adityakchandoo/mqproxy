@@ -10,7 +10,7 @@ import com.ibm.mq.MQQueueManager;
 import com.ibm.mq.constants.MQConstants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -18,48 +18,46 @@ import java.nio.charset.StandardCharsets;
 import java.util.Hashtable;
 
 /**
- * The whole flow lives here:
+ * One request/reply round trip, top to bottom:
  *
  * <pre>
- *   1. connect to the queue manager
- *        - mq_ip given   -> client connection (host/port/channel/user/pass)
- *        - mq_ip missing -> bindings mode, local queue manager: new MQQueueManager(qmName)
- *   2. open the reply queue FIRST (so a fast reply can never be missed)
- *   3. put the JSON payload on the request queue, let MQ generate the MsgId
- *   4. get from the reply queue with MQMO_MATCH_CORREL_ID = that MsgId, waiting up to N ms
- *   5. return the reply body, close everything
+ *   connect()  -> bindings mode if mq_ip is empty, else client connection
+ *   open       -> mq_out (reply queue) first, so a fast reply can never be missed
+ *                 mq_in  (request queue)
+ *   send()     -> put the JSON payload, MQ generates the MsgId
+ *   receive()  -> get from mq_out matching CorrelId = that MsgId, wait up to mq.reply-timeout-ms
+ *   close      -> queue(s) + disconnect
  * </pre>
  *
- * A fresh connection is used per HTTP request (simple, no pooling) - fine for a test tool.
+ * A fresh connection per HTTP request; no pooling. Fine for a test tool.
  */
 @Service
-@EnableConfigurationProperties(MqConfig.class)
 public class MqProxyService {
 
     private static final Logger log = LoggerFactory.getLogger(MqProxyService.class);
 
-    /** CCSID for UTF-8, so MQ knows how to convert the body if the consumer needs it. */
+    /** CCSID for UTF-8. */
     private static final int UTF8_CCSID = 1208;
 
-    private final MqConfig cfg;
+    private final int replyTimeoutMs;
 
-    public MqProxyService(MqConfig cfg) {
-        this.cfg = cfg;
+    public MqProxyService(@Value("${mq.reply-timeout-ms:30000}") int replyTimeoutMs) {
+        this.replyTimeoutMs = replyTimeoutMs;
     }
 
-    /** Everything the proxy needs for one round trip; any field may be null = use the defaults. */
+    /** The HTTP headers, as-is. host/port/channel/user/password may be null. */
     public record MqRequest(String host,
                             Integer port,
                             String channel,
                             String queueManager,
+                            String inQueue,   // mq_in  : we send the request here
+                            String outQueue,  // mq_out : we read the reply here
                             String user,
                             String password,
-                            String requestQueue,
-                            String replyQueue,
                             String payload) {
     }
 
-    /** Thrown when no reply arrives with our correlation id within the wait window. */
+    /** No reply with our correlation id within the wait window. */
     public static class ReplyTimeoutException extends RuntimeException {
         public ReplyTimeoutException(String message) {
             super(message);
@@ -67,141 +65,109 @@ public class MqProxyService {
     }
 
     public String roundTrip(MqRequest req) throws MQException, IOException {
-        String requestQueueName = orElse(req.requestQueue(), cfg.requestQueue());
-        if (requestQueueName == null) {
-            throw new IllegalArgumentException("mq_queue header (or mq.request-queue property) is required");
-        }
-
-        MQQueueManager queueManager = null;
-        MQQueue requestQueue = null;
-        MQQueue replyQueue = null;
+        MQQueueManager queueManager = connect(req);
+        MQQueue outQueue = null;
+        MQQueue inQueue = null;
         try {
-            // 1) connect
-            queueManager = openQueueManager(req);
-
-            // 2) open / create the reply queue before sending anything
-            String replyQueueName = orElse(req.replyQueue(), cfg.replyQueue());
-            if (replyQueueName != null) {
-                replyQueue = queueManager.accessQueue(replyQueueName,
-                        MQC.MQOO_INPUT_AS_Q_DEF | MQC.MQOO_FAIL_IF_QUIESCING);
-            } else {
-                // no reply queue given -> temporary dynamic queue, removed again on close
-                replyQueue = queueManager.accessQueue(cfg.modelQueue(),
-                        MQC.MQOO_INPUT_AS_Q_DEF | MQC.MQOO_FAIL_IF_QUIESCING,
-                        null, cfg.dynamicQueueName(), null);
-                replyQueueName = replyQueue.getName(); // MQ resolves the "*" part
-            }
-            log.info("REPLY queue = {}", replyQueueName);
-
-            requestQueue = queueManager.accessQueue(requestQueueName,
+            // open the reply queue before sending anything
+            outQueue = queueManager.accessQueue(req.outQueue(),
+                    MQC.MQOO_INPUT_AS_Q_DEF | MQC.MQOO_FAIL_IF_QUIESCING);
+            inQueue = queueManager.accessQueue(req.inQueue(),
                     MQC.MQOO_OUTPUT | MQC.MQOO_FAIL_IF_QUIESCING);
 
-            // 3) send the payload
-            MQMessage request = new MQMessage();
-            request.format = MQC.MQFMT_STRING;
-            request.characterSet = UTF8_CCSID;
-            request.replyToQueueName = replyQueueName;
-            request.writeString(req.payload() == null ? "" : req.payload());
-            requestQueue.put(request, new MQPutMessageOptions());
-
-            byte[] msgId = request.messageId; // filled in by MQ
-            log.info("PUT {} ({} chars) msgId={}", requestQueueName, request.getDataLength(), toHex(msgId));
-
-            // 4) wait for the reply whose CorrelId equals our MsgId
-            MQMessage reply = new MQMessage();
-            reply.correlationId = msgId;
-
-            MQGetMessageOptions gmo = new MQGetMessageOptions();
-            gmo.options = MQC.MQGMO_WAIT | MQC.MQGMO_FAIL_IF_QUIESCING;
-            gmo.matchOptions = MQC.MQMO_MATCH_CORREL_ID;
-            gmo.waitInterval = cfg.replyTimeoutMs();
-
-            try {
-                replyQueue.get(reply, gmo);
-            } catch (MQException e) {
-                if (e.reasonCode == MQConstants.MQRC_NO_MSG_AVAILABLE) {
-                    throw new ReplyTimeoutException(
-                            "No reply for msgId " + toHex(msgId) + " within " + cfg.replyTimeoutMs() + " ms");
-                }
-                throw e;
-            }
-
-            // 5) hand the reply body back untouched
-            byte[] body = new byte[reply.getDataLength()];
-            reply.readFully(body);
-            log.info("GOT reply on {} ({} bytes) correlId={}", replyQueueName, body.length, toHex(reply.correlationId));
-            return new String(body, StandardCharsets.UTF_8);
+            byte[] msgId = send(inQueue, req.outQueue(), req.payload());
+            return receive(outQueue, msgId);
         } finally {
-            closeQuietly(replyQueue);
-            closeQuietly(requestQueue);
-            if (queueManager != null) {
-                try {
-                    queueManager.disconnect();
-                } catch (MQException e) {
-                    log.warn("disconnect failed: {}", e.getMessage());
-                }
+            closeQuietly(outQueue);
+            closeQuietly(inQueue);
+            try {
+                queueManager.disconnect();
+            } catch (MQException e) {
+                log.warn("disconnect failed: {}", e.getMessage());
             }
         }
     }
 
-    /**
-     * No mq_ip -> bindings mode against the queue manager on this machine
-     * (needs a real IBM MQ client installation, not just the jar).
-     * mq_ip given -> normal client connection.
-     */
-    private MQQueueManager openQueueManager(MqRequest req) throws MQException {
-        String queueManagerName = orElse(req.queueManager(), cfg.queueManager());
-        if (queueManagerName == null) {
-            throw new IllegalArgumentException("qm_name header (or mq.queue-manager property) is required");
+    /** Puts the payload and returns the MsgId that MQ assigned to it. */
+    private byte[] send(MQQueue queue, String replyToQueue, String payload) throws MQException, IOException {
+        MQMessage message = new MQMessage();
+        message.format = MQC.MQFMT_STRING;
+        message.characterSet = UTF8_CCSID;
+        message.replyToQueueName = replyToQueue;
+        message.writeString(payload == null ? "" : payload);
+
+        queue.put(message, new MQPutMessageOptions());
+        log.info("PUT msgId={}", toHex(message.messageId));
+        return message.messageId;
+    }
+
+    /** Waits for the message on mq_out whose CorrelId equals the request MsgId. */
+    private String receive(MQQueue queue, byte[] msgId) throws MQException, IOException {
+        MQMessage reply = new MQMessage();
+        reply.correlationId = msgId;
+
+        MQGetMessageOptions options = new MQGetMessageOptions();
+        options.options = MQC.MQGMO_WAIT | MQC.MQGMO_FAIL_IF_QUIESCING;
+        options.matchOptions = MQC.MQMO_MATCH_CORREL_ID;
+        options.waitInterval = replyTimeoutMs;
+
+        try {
+            queue.get(reply, options);
+        } catch (MQException e) {
+            if (e.reasonCode == MQConstants.MQRC_NO_MSG_AVAILABLE) {
+                throw new ReplyTimeoutException(
+                        "No reply with correlId " + toHex(msgId) + " within " + replyTimeoutMs + " ms");
+            }
+            throw e;
         }
 
-        String host = orElse(req.host(), cfg.host());
-        if (host == null) {
-            log.info("CONNECT bindings (local) qm={}", queueManagerName);
-            return new MQQueueManager(queueManagerName);
+        byte[] body = new byte[reply.getDataLength()];
+        reply.readFully(body);
+        log.info("GOT reply ({} bytes) correlId={}", body.length, toHex(reply.correlationId));
+        return new String(body, StandardCharsets.UTF_8);
+    }
+
+    /** No mq_ip -> local queue manager (bindings mode). Otherwise a TCP client connection. */
+    private MQQueueManager connect(MqRequest req) throws MQException {
+        if (isBlank(req.host())) {
+            log.info("CONNECT bindings (local) qm={}", req.queueManager());
+            return new MQQueueManager(req.queueManager());
         }
 
-        String channel = orElse(req.channel(), cfg.channel());
-        if (channel == null) {
-            throw new IllegalArgumentException("mq_channel header (or mq.channel property) is required when mq_ip is set");
+        if (isBlank(req.channel())) {
+            throw new IllegalArgumentException("mq_channel header is required when mq_ip is set");
         }
-        int port = (req.port() != null) ? req.port() : cfg.port();
 
         Hashtable<String, Object> props = new Hashtable<>();
-        props.put(MQC.HOST_NAME_PROPERTY, host);
-        props.put(MQC.PORT_PROPERTY, port);
-        props.put(MQC.CHANNEL_PROPERTY, channel);
+        props.put(MQC.HOST_NAME_PROPERTY, req.host());
+        props.put(MQC.PORT_PROPERTY, req.port() == null ? 1414 : req.port());
+        props.put(MQC.CHANNEL_PROPERTY, req.channel());
         props.put(MQC.TRANSPORT_PROPERTY, MQC.TRANSPORT_MQSERIES_CLIENT);
-
-        // Credentials are optional: on a local/test queue manager you can leave
-        // mq_user / mq_pass out and the channel's MCAUSER / CHLAUTH decides.
-        String user = orElse(req.user(), cfg.user());
-        if (user != null) {
-            String password = orElse(req.password(), cfg.password());
-            props.put(MQC.USER_ID_PROPERTY, user);
-            props.put(MQC.PASSWORD_PROPERTY, password == null ? "" : password);
+        // credentials optional: without them the channel's MCAUSER / CHLAUTH decides
+        if (!isBlank(req.user())) {
+            props.put(MQC.USER_ID_PROPERTY, req.user());
+            props.put(MQC.PASSWORD_PROPERTY, req.password() == null ? "" : req.password());
         }
 
         log.info("CONNECT {}:{} channel={} qm={} user={}",
-                host, port, channel, queueManagerName, user == null ? "<none>" : user);
-        return new MQQueueManager(queueManagerName, props);
+                req.host(), props.get(MQC.PORT_PROPERTY), req.channel(), req.queueManager(),
+                isBlank(req.user()) ? "<none>" : req.user());
+        return new MQQueueManager(req.queueManager(), props);
     }
 
     private static void closeQuietly(MQQueue queue) {
-        if (queue != null) {
-            try {
-                queue.close();
-            } catch (MQException e) {
-                log.warn("close failed: {}", e.getMessage());
-            }
+        if (queue == null) {
+            return;
+        }
+        try {
+            queue.close();
+        } catch (MQException e) {
+            log.warn("close failed: {}", e.getMessage());
         }
     }
 
-    private static String orElse(String value, String fallback) {
-        if (value != null && !value.isBlank()) {
-            return value.trim();
-        }
-        return (fallback != null && !fallback.isBlank()) ? fallback.trim() : null;
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     private static String toHex(byte[] bytes) {

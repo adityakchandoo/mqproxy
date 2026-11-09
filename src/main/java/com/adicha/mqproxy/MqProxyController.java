@@ -13,17 +13,20 @@ import reactor.core.scheduler.Schedulers;
 /**
  * Single endpoint: POST /mq
  *
- * <p>All headers are optional and fall back to the {@code mq.*} properties;
- * the only real requirements are a queue manager name and a request queue.
+ * <p>Required headers:
  * <pre>
- *   mq_ip          host of the queue manager  (missing/empty -> local bindings mode)
- *   mq_port        listener port             (default 1414)
- *   mq_channel     server-connection channel (required for a remote mq_ip)
- *   qm_name        queue manager name        (default mq.queue-manager)
- *   mq_user        user id                   (optional -> anonymous connection)
- *   mq_pass        password                  (optional -> anonymous connection)
- *   mq_queue       request queue to put to   (default mq.request-queue)
- *   mq_reply_queue reply queue to read from  (optional -> temp dynamic queue is used)
+ *   qm_name   queue manager name
+ *   mq_in     queue the request is sent to
+ *   mq_out    queue the reply is read from
+ * </pre>
+ *
+ * <p>Optional headers (leave mq_ip out to talk to the local queue manager in bindings mode):
+ * <pre>
+ *   mq_ip      host of the queue manager
+ *   mq_port    listener port (default 1414)
+ *   mq_channel server-connection channel (required when mq_ip is set)
+ *   mq_user    user id (omit for an anonymous connection)
+ *   mq_pass    password
  * </pre>
  *
  * <p>Body: the JSON payload, forwarded as-is. The reply body is returned as-is.
@@ -33,16 +36,15 @@ import reactor.core.scheduler.Schedulers;
  * # remote queue manager
  * curl -X POST http://localhost:8080/mq \
  *   -H 'Content-Type: application/json' \
- *   -H 'mq_ip: 10.0.0.5'      -H 'mq_port: 1414' \
- *   -H 'mq_channel: DEV.APP.SVRCONN' -H 'qm_name: QM1' \
- *   -H 'mq_user: app'         -H 'mq_pass: passw0rd' \
- *   -H 'mq_queue: DEV.REQUEST.QUEUE' \
+ *   -H 'qm_name: QM1' -H 'mq_in: DEV.REQUEST.QUEUE' -H 'mq_out: DEV.REPLY.QUEUE' \
+ *   -H 'mq_ip: 10.0.0.5' -H 'mq_port: 1414' -H 'mq_channel: DEV.APP.SVRCONN' \
+ *   -H 'mq_user: app' -H 'mq_pass: passw0rd' \
  *   -d '{"customerId":"123"}'
  *
- * # local queue manager, bindings mode (no ip/port/channel/user/pass)
+ * # local queue manager, bindings mode
  * curl -X POST http://localhost:8080/mq \
  *   -H 'Content-Type: application/json' \
- *   -H 'qm_name: QM1' -H 'mq_queue: DEV.REQUEST.QUEUE' \
+ *   -H 'qm_name: QM1' -H 'mq_in: DEV.REQUEST.QUEUE' -H 'mq_out: DEV.REPLY.QUEUE' \
  *   -d '{"customerId":"123"}'
  * </pre>
  */
@@ -57,19 +59,18 @@ public class MqProxyController {
 
     @PostMapping(path = "/mq", consumes = MediaType.ALL_VALUE)
     public Mono<ResponseEntity<String>> proxy(
+            @RequestHeader("qm_name") String queueManager,
+            @RequestHeader("mq_in") String inQueue,
+            @RequestHeader("mq_out") String outQueue,
             @RequestHeader(name = "mq_ip", required = false) String host,
             @RequestHeader(name = "mq_port", required = false) Integer port,
             @RequestHeader(name = "mq_channel", required = false) String channel,
-            @RequestHeader(name = "qm_name", required = false) String queueManager,
             @RequestHeader(name = "mq_user", required = false) String user,
             @RequestHeader(name = "mq_pass", required = false) String password,
-            @RequestHeader(name = "mq_queue", required = false) String requestQueue,
-            @RequestHeader(name = "mq_reply_queue", required = false) String replyQueue,
             @RequestBody(required = false) String payload) {
 
         MqProxyService.MqRequest request = new MqProxyService.MqRequest(
-                host, port, channel, queueManager, user, password,
-                requestQueue, replyQueue, payload);
+                host, port, channel, queueManager, inQueue, outQueue, user, password, payload);
 
         // MQ calls are blocking -> run them off the event loop
         return Mono.fromCallable(() -> mqProxyService.roundTrip(request))
@@ -77,7 +78,8 @@ public class MqProxyController {
                 .map(body -> ResponseEntity.ok()
                         .contentType(MediaType.APPLICATION_JSON)
                         .body(body))
-                .onErrorResume(MqProxyService.ReplyTimeoutException.class, e -> Mono.just(plain(HttpStatus.GATEWAY_TIMEOUT, e)))
+                .onErrorResume(MqProxyService.ReplyTimeoutException.class,
+                        e -> Mono.just(plain(HttpStatus.GATEWAY_TIMEOUT, e)))
                 .onErrorResume(e -> Mono.just(plain(HttpStatus.BAD_GATEWAY, e)));
     }
 
