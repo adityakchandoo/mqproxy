@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Hashtable;
+import java.util.Map;
 
 /**
  * One request/reply round trip, top to bottom:
@@ -54,6 +55,7 @@ public class MqProxyService {
                             String outQueue,  // mq_out : we read the reply here
                             String user,
                             String password,
+                            Map<String, String> meta, // meta_* headers -> MQ message properties
                             String payload) {
     }
 
@@ -75,7 +77,7 @@ public class MqProxyService {
             inQueue = queueManager.accessQueue(req.inQueue(),
                     MQC.MQOO_OUTPUT | MQC.MQOO_FAIL_IF_QUIESCING);
 
-            byte[] msgId = send(inQueue, req.outQueue(), req.payload());
+            byte[] msgId = send(inQueue, req);
             return receive(outQueue, msgId);
         } finally {
             closeQuietly(outQueue);
@@ -89,15 +91,20 @@ public class MqProxyService {
     }
 
     /** Puts the payload and returns the MsgId that MQ assigned to it. */
-    private byte[] send(MQQueue queue, String replyToQueue, String payload) throws MQException, IOException {
+    private byte[] send(MQQueue queue, MqRequest req) throws MQException, IOException {
         MQMessage message = new MQMessage();
         message.format = MQC.MQFMT_STRING;
         message.characterSet = UTF8_CCSID;
-        message.replyToQueueName = replyToQueue;
-        message.writeString(payload == null ? "" : payload);
+        message.replyToQueueName = req.outQueue();
+        message.writeString(req.payload() == null ? "" : req.payload());
+
+        // meta_* headers become MQ message properties (RFH2 usr. folder)
+        for (Map.Entry<String, String> meta : req.meta().entrySet()) {
+            message.setStringProperty(meta.getKey(), meta.getValue());
+        }
 
         queue.put(message, new MQPutMessageOptions());
-        log.info("PUT msgId={}", toHex(message.messageId));
+        log.info("PUT msgId={} properties={}", toHex(message.messageId), req.meta().keySet());
         return message.messageId;
     }
 

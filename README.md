@@ -34,6 +34,26 @@ App listens on `http://localhost:8080` (override with `server.port`).
 | `mq_channel` | with `mq_ip` | – | server-connection channel |
 | `mq_user` | no | *empty* | user id. Empty = anonymous connection (channel `MCAUSER`/CHLAUTH decides) |
 | `mq_pass` | no | *empty* | password |
+| `meta_<name>` | no | – | every header starting with the literal prefix `meta_` (case-sensitive) is copied into the MQ message as property `<name>` |
+
+### `meta_` headers -> MQ message properties
+
+Any request header whose name starts with `meta_` (exact case) is added to the message as a **string
+property**. The prefix is stripped:
+
+```
+meta_sourceSystem: BILLING   ->  MQ property sourceSystem = BILLING
+meta_traceId: 9f8c...        ->  MQ property traceId     = 9f8c...
+Meta_ignored: x              ->  not copied (uppercase M)
+```
+
+Notes:
+
+* Property names are unqualified, so the MQ Java classes store them in the RFH2 `usr.` folder
+  (`usr.sourceSystem`). A JMS consumer reads them back as plain `sourceSystem`.
+* Values are always strings. Repeated headers are joined with `,`.
+* When at least one `meta_` header is sent, MQ wraps the payload in an MQRFH2 and the message format
+  becomes `MQHRF2` instead of `MQSTR` — relevant if the consumer parses the header itself.
 
 Server-side default (in `application.properties`):
 
@@ -114,7 +134,20 @@ curl -v -X POST http://localhost:8080/mq \
   --data-binary @request.json
 ```
 
-### 6. Windows PowerShell / cmd
+### 6. With MQ message properties from `meta_` headers
+
+```bash
+curl -X POST http://localhost:8080/mq \
+  -H 'Content-Type: application/json' \
+  -H 'qm_name: QM1' -H 'mq_in: DEV.REQUEST.QUEUE' -H 'mq_out: DEV.REPLY.QUEUE' \
+  -H 'meta_sourceSystem: BILLING' \
+  -H 'meta_traceId: 9f8c1d77' \
+  -d '{"customerId":"123"}'
+```
+
+The message on `DEV.REQUEST.QUEUE` then carries the properties `sourceSystem` and `traceId`.
+
+### 7. Windows PowerShell / cmd
 
 In PowerShell `curl` is an alias for `Invoke-WebRequest`; use `curl.exe`:
 
@@ -126,6 +159,37 @@ curl.exe -X POST http://localhost:8080/mq `
   -H "mq_out: DEV.REPLY.QUEUE" `
   -d '{\"customerId\":\"123\"}'
 ```
+
+## Docker
+
+Build:
+
+```bash
+docker build -t mqproxy:latest .
+```
+
+Run (map the port; the proxy itself is stateless, all MQ settings come from the request headers):
+
+```bash
+docker run --rm -p 8080:8080 --name mqproxy mqproxy:latest
+```
+
+Then call it exactly like the curl examples above:
+
+```bash
+curl -X POST http://localhost:8080/mq \
+  -H 'Content-Type: application/json' \
+  -H 'qm_name: QM1' -H 'mq_in: DEV.REQUEST.QUEUE' -H 'mq_out: DEV.REPLY.QUEUE' \
+  -H 'mq_ip: 10.0.0.5' -H 'mq_channel: DEV.APP.SVRCONN' \
+  -d '{"customerId":"123"}'
+```
+
+Notes for Docker:
+
+* The image is a two-stage build on `maven:3.9-eclipse-temurin-21` + `eclipse-temurin:21-jre`.
+* **Bindings mode does not work in the container** (no local queue manager / client install), so always
+  send `mq_ip` (use `host.docker.internal` or the container name to reach MQ from Docker).
+* HTTP port can be changed with `-e SERVER_PORT=9090 -p 9090:9090`.
 
 ## Responses
 
@@ -157,6 +221,6 @@ Each call logs the flow:
 
 ```
 CONNECT 10.0.0.5:1414 channel=DEV.APP.SVRCONN qm=QM1 user=app
-PUT msgId=414D...
+PUT msgId=414D... properties=[sourceSystem, traceId]
 GOT reply (87 bytes) correlId=414D...
 ```

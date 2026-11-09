@@ -1,5 +1,6 @@
 package com.adicha.mqproxy;
 
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -9,6 +10,9 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Single endpoint: POST /mq
@@ -27,6 +31,8 @@ import reactor.core.scheduler.Schedulers;
  *   mq_channel server-connection channel (required when mq_ip is set)
  *   mq_user    user id (omit for an anonymous connection)
  *   mq_pass    password
+ *   meta_<x>   any header starting with the literal, case-sensitive prefix "meta_"
+ *              is copied to the MQ message as property "<x>" (string value)
  * </pre>
  *
  * <p>Body: the JSON payload, forwarded as-is. The reply body is returned as-is.
@@ -51,6 +57,8 @@ import reactor.core.scheduler.Schedulers;
 @RestController
 public class MqProxyController {
 
+    private static final String META_PREFIX = "meta_";
+
     private final MqProxyService mqProxyService;
 
     public MqProxyController(MqProxyService mqProxyService) {
@@ -67,10 +75,12 @@ public class MqProxyController {
             @RequestHeader(name = "mq_channel", required = false) String channel,
             @RequestHeader(name = "mq_user", required = false) String user,
             @RequestHeader(name = "mq_pass", required = false) String password,
+            @RequestHeader HttpHeaders headers,
             @RequestBody(required = false) String payload) {
 
         MqProxyService.MqRequest request = new MqProxyService.MqRequest(
-                host, port, channel, queueManager, inQueue, outQueue, user, password, payload);
+                host, port, channel, queueManager, inQueue, outQueue, user, password,
+                metaHeaders(headers), payload);
 
         // MQ calls are blocking -> run them off the event loop
         return Mono.fromCallable(() -> mqProxyService.roundTrip(request))
@@ -81,6 +91,17 @@ public class MqProxyController {
                 .onErrorResume(MqProxyService.ReplyTimeoutException.class,
                         e -> Mono.just(plain(HttpStatus.GATEWAY_TIMEOUT, e)))
                 .onErrorResume(e -> Mono.just(plain(HttpStatus.BAD_GATEWAY, e)));
+    }
+
+    /** meta_foo: bar -> MQ message property foo=bar. Prefix match is case-sensitive. */
+    private static Map<String, String> metaHeaders(HttpHeaders headers) {
+        Map<String, String> meta = new LinkedHashMap<>();
+        headers.forEach((name, values) -> {
+            if (name.startsWith(META_PREFIX)) {
+                meta.put(name.substring(META_PREFIX.length()), String.join(",", values));
+            }
+        });
+        return meta;
     }
 
     private static ResponseEntity<String> plain(HttpStatus status, Throwable e) {
